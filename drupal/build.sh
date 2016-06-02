@@ -25,7 +25,7 @@ build_sh_version_string = "build.sh 1.0"
 build_sh_skip_backup = False
 build_sh_disable_cache = False
 
-# Sitt.make item (either a project/library from the site.make)
+# Site.make item (either a project/library from the site.make)
 class MakeItem:
 
 	def __init__(self, type, name):
@@ -87,20 +87,25 @@ class Maker:
 
 	def __init__(self, settings):
 
+		self.composer = settings.get('composer', 'composer')
 		self.drush = settings.get('drush', 'drush')
+		self.type = settings.get('type', 'drush make')
+		self.drupal_subpath = settings.get('drupal_subpath', '')
 		self.temp_build_dir_name = settings['temporary']
 		self.temp_build_dir = os.path.abspath(self.temp_build_dir_name)
 		self.final_build_dir_name = settings['final']
 		self.final_build_dir = os.path.abspath(self.final_build_dir_name)
 		self.old_build_dir = os.path.abspath(settings.get('previous', 'previous'))
-		self.makefile = os.path.abspath(settings.get('makefile', 'conf/site.make'))
 		self.profile_name = settings.get('profile', 'standard')
 		self.site_name = settings.get('site', 'A drupal site')
 		self.make_cache_dir = settings.get('make_cache', '.make_cache')
 		self.settings = settings
 		self.store_old_buids = True
 		self.linked = False
-		self.makefile_hash = hashlib.md5(open(self.makefile, 'rb').read()).hexdigest()
+
+		if self.type == 'drush make':
+			self.makefile = os.path.abspath(settings.get('makefile', 'conf/site.make'))
+			self.makefile_hash = hashlib.md5(open(self.makefile, 'rb').read()).hexdigest()
 
 		# See if drush is installed
 		if not self._which('drush'):
@@ -157,6 +162,20 @@ class Maker:
 
 	# Run make
 	def make(self):
+		if self.type == 'drush make':
+			self._drush_make()
+		elif self.type == 'composer':
+			self._composer_make()
+
+	def _composer_make(self):
+		self._precheck()
+		self.link()
+		self._composer([
+			'-d=' + self.temp_build_dir,
+			'install'
+		]);
+
+	def _drush_make(self):
 		global build_sh_disable_cache
 		self._precheck()
 		self.notice("Building")
@@ -175,7 +194,7 @@ class Maker:
 			if not self._drush(self._collect_make_args()):
 				raise BuildError("Make failed - check your makefile")
 
-			os.remove(self.temp_build_dir + "/sites/default/default.settings.php")
+			#os.remove(self.temp_build_dir + "/sites/default/default.settings.php")
 
 			if not os.path.isdir(self.make_cache_dir):
 				os.makedirs(self.make_cache_dir)
@@ -235,10 +254,9 @@ class Maker:
 	def finalize(self):
 		self.notice("Finalizing new build")
 		if os.path.isdir(self.final_build_dir):
+			self._unlink()
 			self._ensure_writable(self.final_build_dir)
-                        self._unlink()
 			shutil.rmtree(self.final_build_dir)
-
 		# Make sure linking has happened
 		if not self.linked:
 			self.link()
@@ -259,7 +277,7 @@ class Maker:
 	# Run install
 	def install(self):
 		if not self._drush([
-			"--root=" + format(self.final_build_dir),
+			"--root=" + format(self.final_build_dir + self.drupal_subpath),
 			"site-install",
 			self.profile_name,
 			"install_configure_form.update_status_module='array(FALSE,FALSE)'"
@@ -273,7 +291,7 @@ class Maker:
 	# Update existing final build
 	def update(self):
 		if self._drush([
-			"--root=" + format(self.final_build_dir),
+			"--root=" + format(self.final_build_dir + self.drupal_subpath),
 			'updatedb',
 			'--y'
 		]):
@@ -361,7 +379,7 @@ class Maker:
 		if not "link" in self.settings:
 			return
 		for tuple in self.settings['link']:
-			source, target = tuple.popitem()
+			source, target = tuple.items()[0]
 			target = self.temp_build_dir + "/" + target
 			if source.endswith('*'):
 				path = source[:-1]
@@ -396,6 +414,13 @@ class Maker:
 			target = self.temp_build_dir + "/" + target
 			self._copy_files(source, target)
 
+	# Execute a composer command
+	def _composer(self, args, quiet = False):
+		if quiet:
+			FNULL = open(os.devnull, 'w')
+			return subprocess.call([self.composer] + args, stdout=FNULL, stderr=FNULL) == 0
+		return subprocess.call([self.composer] + args) == 0
+
 	# Execute a drush command
 	def _drush(self, args, quiet = False):
 		if quiet:
@@ -429,7 +454,7 @@ class Maker:
 			gzdump_file = self.final_build_dir + '/db.sql.gz'
 
 			if self._drush([
-				"--root=" + format(self.final_build_dir),
+				"--root=" + format(self.final_build_dir + self.drupal_subpath),
 				'sql-dump',
 				'--result-file=' + dump_file
 			], True):
@@ -458,7 +483,7 @@ class Maker:
 	# Wipe existing final build
 	def _wipe(self):
 		if self._drush([
-			'--root=' + format(self.final_build_dir),
+			'--root=' + format(self.final_build_dir + self.drupal_subpath),
 			'sql-drop',
 			'--y'
 		], True):
@@ -525,6 +550,8 @@ def help():
 	print '			Print this help'
 	print ' -c --config'
 	print '			Configuration file to use, defaults to conf/site.yml'
+	print ' -o --commands'
+	print '			Configuration file to use, defaults to conf/commands.yml'
 	print ' -s --skip-backup'
 	print '			Do not take backups, ever'
 	print ' -d --disable-cache'
@@ -542,11 +569,12 @@ def main(argv):
 
 	# Default configuration file to use:
 	config_file = 'conf/site.yml'
+	commands_file = 'conf/commands.yml'
 	do_build = True
 
 	# Parse options:
 	try:
-		opts, args = getopt.getopt(argv, "hdc:vst", ["help", "config=", "version", "test", "skip-backup", "disable-cache"])
+		opts, args = getopt.getopt(argv, "hdc:o:vst", ["help", "config=", "commands=", "version", "test", "skip-backup", "disable-cache"])
 	except getopt.GetoptError:
 		help()
 		return
@@ -557,6 +585,8 @@ def main(argv):
 			return
 		elif opt in ("-c", "--config"):
 			config_file = arg
+		elif opt in ("-o", "--commands"):
+			commands_file = arg
 		elif opt in ("-s", "--skip-backup"):
 			global build_sh_skip_backup
 			build_sh_skip_backup = True
@@ -619,26 +649,40 @@ def main(argv):
 
 			# Create the site maker based on the settings
 			maker = Maker(site_settings)
-			settings['commands']['test'] = {"test": "test"}
 
 			maker.notice("Using configuration " + site)
 
+			commands = {}
+
+			if 'commands' in settings:
+				commands = settings['commands']
+				maker.warning("There are commands defined in site.yml - please move them to commands.yml.")
+
+			# Read in the commands file
+			if os.path.isfile(commands_file):
+				if 'commands' in settings:
+					maker.warning("Commands defined in commands.yml override the commands defined in site.yml")
+				f = open(commands_file)
+				commands = yaml.safe_load(f)
+				f.close()
+
+			commands['test'] = {"test": "test"}
+
 			# Add and overwrite commands with local_commands
 			if 'local_commands' in settings[site]:
-				settings['commands'].update(settings[site]['local_commands'])
+				commands.update(settings[site]['local_commands'])
 
 			if do_build:
 				# Execute the command(s).
-				if command in settings['commands']:
-					command_set = settings['commands'][command]
+				if command in commands:
+					command_set = commands[command]
 					for step in command_set:
 						maker.execute(step)
 				else:
-					print "No such command defined as '" + command + "'"
+					maker.notice("No such command defined as '" + command + "'")
 
 
 	except Exception, errtxt:
-
 		print "\033[91m** BUILD ERROR: \033[0m%s" % (errtxt)
 		exit(1)
 
